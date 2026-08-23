@@ -1,8 +1,7 @@
 """
 ====================================================================
-PROJE: Offline Local RAG (Retrieval-Augmented Generation) AI Assistant
-ALTYAPI: Microsoft Foundry Local + Qwen 2.5 (0.5B) + BGE Embeddings + SQLite
-MÜFREDAT: 6-Week Local AI Masterclass Final Production Code
+PROJE: Offline Local RAG AI Assistant (Strict Guardrail & Similarity Gate)
+ALTYAPI: Microsoft Foundry Local + Qwen 2.5 (0.5B) + BGE-small + SQLite
 ====================================================================
 """
 
@@ -27,19 +26,19 @@ LLM_MODEL_NAME = "qwen2.5-0.5b"
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 40
 TOP_K_RESULTS = 3
+SIMILARITY_THRESHOLD = 0.45  # Bu değerin altındaki alakasız sorular doğrudan reddedilir.
+FALLBACK_RESPONSE = "The provided document context does not contain information to answer this question."
 
 
 # ====================================================================
 # 1. STEP: DATA INGESTION & PIPELINE SETUP
 # ====================================================================
 def initialize_database():
-    """PDF dökümanını okur, gürültüyü temizler, vektörleştirir ve SQLite veritabanını günceller."""
+    """PDF dökümanını okur, gürültüyü temizler, vektörleştirir ve SQLite veritabanına kaydeder."""
     print("📥 [1/4] PDF dökümanı taranıyor ve metin dilimleniyor...")
 
     if not os.path.exists(PDF_PATH):
-        print(
-            f"❌ Hata: '{PDF_PATH}' dosyası bulunamadı! Lütfen klasöre ekleyin."
-        )
+        print(f"❌ Hata: '{PDF_PATH}' dosyası bulunamadı! Lütfen klasöre ekleyin.")
         exit(1)
 
     loader = PyPDFLoader(PDF_PATH)
@@ -50,7 +49,6 @@ def initialize_database():
     )
     chunks = text_splitter.split_documents(documents)
 
-    # Gürültü ve kaynakça filtreleme
     filtered_chunks = []
     for c in chunks:
         content = c.page_content.strip()
@@ -61,10 +59,7 @@ def initialize_database():
         filtered_chunks.append(content)
 
     print(f"--> {len(filtered_chunks)} adet optimize edilmiş metin parçası hazır.")
-
-    print(
-        f"🧠 [2/4] BGE Vektör Modeli ({EMBEDDING_MODEL_NAME}) yükleniyor..."
-    )
+    print(f"🧠 [2/4] BGE Vektör Modeli ({EMBEDDING_MODEL_NAME}) yükleniyor...")
     embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
     print(f"💾 [3/4] SQLite Veritabanı ({DB_PATH}) güncelleniyor...")
@@ -93,7 +88,7 @@ def initialize_database():
 
     conn.commit()
     conn.close()
-    print("--> Vektör veritabanı başarıyla senkronize edildi!\n")
+    print("--> Vektör veritabanı senkronize edildi!\n")
     return embed_model
 
 
@@ -101,23 +96,23 @@ def initialize_database():
 # 2. STEP: VECTOR RETRIEVAL ENGINE
 # ====================================================================
 def search_similar_chunks(query, embed_model, top_k=TOP_K_RESULTS):
-    """Kullanıcı sorusunu vektörleştirir ve Kosinüs Benzerliği ile veritabanında arar."""
+    """Kullanıcı sorusunu vektörleştirir ve Kosinüs Benzerliği hesaplar."""
     clean_query = query.strip().strip('"').strip("'")
     query_vector = embed_model.encode(clean_query, normalize_embeddings=True)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT content, embedding FROM documents")
+    cursor.execute("SELECT id, content, embedding FROM documents")
     rows = cursor.fetchall()
     conn.close()
 
     results = []
-    for content, vector_str in rows:
+    for doc_id, content, vector_str in rows:
         doc_vector = np.array(json.loads(vector_str))
-        sim_score = np.dot(query_vector, doc_vector)  # Skaler Çarpım
-        results.append((content, sim_score))
+        sim_score = float(np.dot(query_vector, doc_vector))
+        results.append((doc_id, content, sim_score))
 
-    results.sort(key=lambda x: x[1], reverse=True)
+    results.sort(key=lambda x: x[2], reverse=True)
     return results[:top_k]
 
 
@@ -125,10 +120,8 @@ def search_similar_chunks(query, embed_model, top_k=TOP_K_RESULTS):
 # 3. STEP: MAIN APPLICATION & SYSTEM EXECUTION
 # ====================================================================
 def main():
-    # Veritabanını ve Vektör Modelini Hazırla
     embed_model = initialize_database()
 
-    # Foundry Local Runtime ve Qwen 2.5 Modeli Başlatma
     print(
         f"⚡ [4/4] Microsoft Foundry Local Runtime & LLM ({LLM_MODEL_NAME}) başlatılıyor..."
     )
@@ -140,14 +133,14 @@ def main():
 
     print("\n" + "=" * 65)
     print("🤖 OFFLINE LOCAL RAG AI ASSISTANT IS READY FOR DEMO!")
-    print("Sıfır İnternet Bağlantısı | Tam Yerel Çalışma | Sıfır Halüsinasyon")
+    print("Sıfır Halüsinasyon | Similarity Threshold Korumalı | Tam Yerel")
     print("=" * 65 + "\n")
 
     while True:
         try:
             soru = input("\nSoru girin (Çıkış için 'q'): ")
             if soru.lower() in ["çıkış", "exit", "q"]:
-                print("RAG Asistanı kapatılıyor. Love you <3")
+                print("RAG Asistanı kapatılıyor. İyi çalışmalar!")
                 break
 
             if not soru.strip():
@@ -158,28 +151,42 @@ def main():
             en_alakali_parcalar = search_similar_chunks(soru, embed_model)
             retrieval_time = time.time() - t0_retrieval
 
-            # Context Bağlamını Oluşturma
+            en_yuksek_skor = en_alakali_parcalar[0][2] if en_alakali_parcalar else 0.0
+
+            # B) DETERMINISTIC GUARDRAIL (Eşik Kontrolü)
+            if en_yuksek_skor < SIMILARITY_THRESHOLD:
+                print("\n=== AI ANSWER ===")
+                print(FALLBACK_RESPONSE)
+                print("-" * 55)
+                print(f"🛡️  Guardrail Devreye Girdi (Max Benzerlik: {en_yuksek_skor:.3f} < {SIMILARITY_THRESHOLD})")
+                print(f"⏱️  Metrikler | Arama: {retrieval_time:.3f}s | LLM Üretim: 0.00s | Toplam: {retrieval_time:.3f}s")
+                print("-" * 55)
+                continue
+
+            # C) STRICT ZERO-INFERENCE PROMPT
             context_text = "\n\n".join(
                 [
-                    f"[Document Part {i+1}]: {p[0]}"
+                    f"[Document Part {i+1}]: {p[1]}"
                     for i, p in enumerate(en_alakali_parcalar)
                 ]
             )
 
-            # B) STRICT GUARDRAIL SYSTEM PROMPT
             system_msg = (
-                "You are a strict academic Q&A assistant. "
-                "Answer the question using ONLY the facts explicitly provided in the Document Parts. "
-                "If the answer is found, provide a concise answer AND explicitly cite which Document Part you used (e.g., [Document Part 1]). "
-                "If the answer is NOT present in the text, respond exactly: "
-                "'The provided document context does not contain information to answer this question.'"
+                "You are an exact fact-extraction bot.\n"
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. Answer ONLY using direct statements explicitly found in the Document Parts.\n"
+                "2. Do NOT guess, do NOT assume, and do NOT make logical inferences.\n"
+                "3. Append the citation tag (e.g. [Document Part 1]) to every factual claim.\n"
+                f"4. If the exact answer is not explicitly written, output strictly: '{FALLBACK_RESPONSE}'"
             )
 
             user_msg = (
-                f"Document Parts:\n{context_text}\n\nQuestion: {soru}\nAnswer:"
+                f"Document Parts:\n{context_text}\n\n"
+                f"Question: {soru}\n"
+                f"Direct Answer (with [Document Part X]):"
             )
 
-            # C) GENERATION & BENCHMARK
+            # D) GENERATION & BENCHMARK
             t0_gen = time.time()
             response = client.complete_chat(
                 [
@@ -188,15 +195,21 @@ def main():
                 ]
             )
             gen_time = time.time() - t0_gen
+            answer_content = response.choices[0].message.content
 
-            # D) DISPLAY OUTPUT & METRICS
+            # E) DISPLAY OUTPUT & METRICS
             print("\n=== AI ANSWER ===")
-            print(response.choices[0].message.content)
-            print("-" * 50)
+            print(answer_content)
+            print("-" * 55)
+            print("Geri Getirilen Kaynak Parçaları:")
+            for i, p in enumerate(en_alakali_parcalar):
+                snippet = p[1][:90].replace("\n", " ") + "..."
+                print(f"  • [Document Part {i+1}] (ID: {p[0]} | Benzerlik: {p[2]:.3f}): \"{snippet}\"")
+            print("-" * 55)
             print(
                 f"⏱️  Metrikler | Arama: {retrieval_time:.3f}s | LLM Üretim: {gen_time:.2f}s | Toplam: {retrieval_time + gen_time:.2f}s"
             )
-            print("-" * 50)
+            print("-" * 55)
 
         except Exception as e:
             print(f"❌ Bir hata oluştu: {e}")
